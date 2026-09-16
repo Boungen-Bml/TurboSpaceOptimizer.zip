@@ -19,37 +19,18 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # Only unzips if a project zip is sitting in the repo root - if you
-      # instead committed the TurboSpaceOptimizer/ folder directly (no zip),
-      # this step just does nothing and the checkout above already has it.
-      - name: Extract project (if zipped)
-        run: |
-          ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1)
-          if [ -n "$ZIP_FILE" ]; then
-            unzip -o "$ZIP_FILE"
-          fi
-
-      # This project doesn't ship a committed Gradle wrapper binary (gradlew
-      # + gradle-wrapper.jar), since those are generated files. This
-      # generates one fresh on every run instead of guessing a version.
       - name: Generate Gradle wrapper
-        working-directory: TurboSpaceOptimizer
         run: |
           if [ ! -f "./gradlew" ]; then
             gradle wrapper --gradle-version 8.9
           fi
           chmod +x gradlew
 
-      # Deliberately does NOT touch any .kt file. The project's source is
-      # meant to build as-is; if it doesn't, that is a source-code problem
-      # to fix in MainActivity.kt directly, not something to sed around at
-      # build time.
       - name: Build debug APK
-        working-directory: TurboSpaceOptimizer
         run: ./gradlew assembleDebug --stacktrace
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: TurboSpace-Optimizer-APK
-          path: TurboSpaceOptimizer/app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/*.apk
