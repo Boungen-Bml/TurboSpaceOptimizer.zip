@@ -45,10 +45,6 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-service:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
-    // Fix for: "Unresolved reference 'ViewTreeViewModelStoreOwner'" /
-    // 'viewModelStore'. lifecycle-runtime-ktx alone does not carry the
-    // ViewModelStore/ViewModelStoreOwner classes - they live in this
-    // separate viewmodel artifact.
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.6")
     implementation("androidx.savedstate:savedstate-ktx:1.2.1")
 
@@ -58,13 +54,9 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.runtime:runtime")
 
-    // Shizuku — required for every privileged shell command in this app
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
 
-    // Coil — loads the animated GIF background on the main hub screen.
-    // coil-compose gives us the AsyncImage composable; coil-gif adds the
-    // actual GIF frame decoder (without it, only the first frame would show).
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("io.coil-kt:coil-gif:2.7.0")
 }
