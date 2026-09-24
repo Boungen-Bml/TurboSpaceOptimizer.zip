@@ -1,0 +1,2077 @@
+package com.turbospace.optimizer
+
+import android.app.ActivityManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.graphics.PixelFormat
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.view.Gravity
+import android.view.WindowManager
+import android.view.ViewGroup
+import android.widget.Toast
+import android.widget.VideoView
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CutCornerShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.consume
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.toBitmap
+import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
+import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.lifecycle.setViewTreeViewModelStoreOwner
+import androidx.lifecycle.setViewTreeSavedStateRegistryOwner
+import androidx.savedstate.SavedStateRegistry
+import androidx.savedstate.SavedStateRegistryController
+import androidx.savedstate.SavedStateRegistryOwner
+import coil.ImageLoader
+import coil.compose.AsyncImage
+import coil.decode.GifDecoder
+import coil.decode.ImageDecoderDecoder
+import coil.request.ImageRequest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import rikka.shizuku.Shizuku
+
+// ============================================================================
+// 1. MAIN ENTRY POINT
+// ============================================================================
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { TurboSpaceApp() }
+    }
+}
+
+// ============================================================================
+// 2. THEME
+// ============================================================================
+object TurboColors {
+    val BrightRed = Color(0xFFFF1A1A)
+    val BrightGlowRed = Color(0xFFFF4D4D)
+    val ActiveRedBg = Color(0xFF4A0000)
+    val DarkBackground = Color(0xFF0F0E13)
+    val CardBackground = Color(0xFF1E1C24)
+    val BorderGray = Color(0xFF3D3A46)
+    val TextGray = Color(0xFFA09DAA)
+    val EngineStopGray = Color(0xFF555555)
+
+    val HudObsidian = Color(0xFF0B0C10)
+    val HudCyan = Color(0xFF00F0FF)
+    val HudPurple = Color(0xFFA020F0)
+    val HudCrimson = Color(0xFFFF003C)
+    val HudGreen = Color(0xFF39FF6A)
+}
+
+// ============================================================================
+// 3. PERFORMANCE FEATURE DEFINITIONS
+// ============================================================================
+enum class PerformanceFeature(
+    val id: String,
+    val icon: String,
+    val title: String,
+    val stateful: Boolean
+) {
+    GAME_PERFORMANCE("game_performance", "🎮", "Game Performance", true),
+    THERMAL_CONTROL("thermal_control", "🔥", "Thermal Control", true),
+    PROCESS_CONTROL("process_control", "📱", "Process Control", true),
+    IDLE_CONTROL("idle_control", "🌙", "Idle Control", true),
+    RESOURCE_CLEANUP("resource_cleanup", "🧹", "Resource Cleanup", false),
+    GFX_BOOST("gfx_boost", "⚡", "GFX Boost", false),
+    APP_OPTIMIZATION("app_optimization", "🧠", "App Optimization", false),
+    INPUT_CONFIGURATION("input_configuration", "⚙️", "Input Configuration", false),
+    TRIM_CACHE("trim_cache", "🗑️", "Trim Cache", false)
+}
+
+private fun Set<String>.toPerformanceFeatures(): Set<PerformanceFeature> = mapNotNull { id ->
+    PerformanceFeature.values().firstOrNull { it.id == id }
+}.toSet()
+
+private fun Set<PerformanceFeature>.toIds(): Set<String> = map { it.id }.toSet()
+
+// ============================================================================
+// 4. SESSION SNAPSHOT
+// ============================================================================
+data class GameSessionSnapshot(
+    val gamePackage: String,
+    val previousGameMode: String?,
+    val previousThermalOverride: Int?,
+    val previousProcessLimit: String?,
+    val previousIdleForced: Boolean?
+)
+
+data class RestoreResult(
+    val success: Boolean,
+    val warnings: List<String> = emptyList()
+)
+
+// ============================================================================
+// 5. REPOSITORY & APP STATE
+// ============================================================================
+object TurboSpaceRepository {
+    private val _selectedGame = MutableStateFlow("NO TARGET SELECTED")
+    val selectedGame: StateFlow<String> = _selectedGame.asStateFlow()
+
+    private val _selectedFeatures = MutableStateFlow<Set<PerformanceFeature>>(emptySet())
+    val selectedFeatures: StateFlow<Set<PerformanceFeature>> = _selectedFeatures.asStateFlow()
+
+    private val _selectedCpuApps = MutableStateFlow<Set<String>>(emptySet())
+    val selectedCpuApps: StateFlow<Set<String>> = _selectedCpuApps.asStateFlow()
+
+    private val _selectedGpuGame = MutableStateFlow("NO TARGET SELECTED")
+    val selectedGpuGame: StateFlow<String> = _selectedGpuGame.asStateFlow()
+
+    private val _isCpuActive = MutableStateFlow(false)
+    val isCpuActive: StateFlow<Boolean> = _isCpuActive.asStateFlow()
+
+    private val _isGpuActive = MutableStateFlow(false)
+    val isGpuActive: StateFlow<Boolean> = _isGpuActive.asStateFlow()
+
+    private val _isCpuLoading = MutableStateFlow(false)
+    val isCpuLoading: StateFlow<Boolean> = _isCpuLoading.asStateFlow()
+
+    private val _isGpuLoading = MutableStateFlow(false)
+    val isGpuLoading: StateFlow<Boolean> = _isGpuLoading.asStateFlow()
+
+    private val _isSessionStarting = MutableStateFlow(false)
+    val isSessionStarting: StateFlow<Boolean> = _isSessionStarting.asStateFlow()
+
+    private val _isSessionActive = MutableStateFlow(false)
+    val isSessionActive: StateFlow<Boolean> = _isSessionActive.asStateFlow()
+
+    private val _isResetting = MutableStateFlow(false)
+    val isResetting: StateFlow<Boolean> = _isResetting.asStateFlow()
+
+    fun restoreFromPrefs(context: Context) {
+        val ownPackage = context.packageName
+        val saved = TurboSpaceManager.loadAppState(context)
+
+        _selectedGame.value = if (saved.selectedGame == ownPackage) {
+            "NO TARGET SELECTED"
+        } else {
+            saved.selectedGame
+        }
+
+        _selectedFeatures.value = saved.selectedFeatureIds.toPerformanceFeatures()
+
+        _selectedCpuApps.value = saved.cpuApps
+            .filterNot { it == ownPackage }
+            .toSet()
+
+        _selectedGpuGame.value = if (saved.gpuGame == ownPackage) {
+            "NO TARGET SELECTED"
+        } else {
+            saved.gpuGame
+        }
+
+        _isCpuActive.value = saved.cpuActive
+        _isGpuActive.value = saved.gpuActive
+        _isSessionActive.value = TurboSpaceManager.hasSavedSession(context)
+    }
+
+    fun setSelectedGame(context: Context, packageName: String) {
+        if (!TurboSpaceManager.isRecognizedGame(context, packageName)) {
+            Toast.makeText(context, "Only recognized games can be selected", Toast.LENGTH_SHORT).show()
+            return
+        }
+        _selectedGame.value = packageName
+        persist(context)
+    }
+
+    fun setFeatureEnabled(context: Context, feature: PerformanceFeature, enabled: Boolean) {
+        _selectedFeatures.value = if (enabled) {
+            _selectedFeatures.value + feature
+        } else {
+            _selectedFeatures.value - feature
+        }
+        persist(context)
+    }
+
+    fun setSelectedCpuApps(context: Context, apps: Set<String>) {
+        _selectedCpuApps.value = apps.filterNot { it == context.packageName }.toSet()
+        persist(context)
+    }
+
+    fun setSelectedGpuGame(context: Context, packageName: String) {
+        if (!TurboSpaceManager.isRecognizedGame(context, packageName)) {
+            Toast.makeText(context, "GPU Optimization only accepts games", Toast.LENGTH_SHORT).show()
+            return
+        }
+        _selectedGpuGame.value = packageName
+        persist(context)
+    }
+
+    suspend fun startCpuOpt(context: Context) {
+        _isCpuLoading.value = true
+        try {
+            val apps = _selectedCpuApps.value
+            if (apps.isEmpty()) {
+                TurboSpaceManager.showToast(context, "Select at least one app for CPU Optimization")
+                return
+            }
+            val outcomes = apps.map { pkg -> TurboSpaceManager.reduceCpuLoad(context, pkg) }
+            val ok = outcomes.none { it == TurboSpaceManager.CommandOutcome.BOTH_FAILED }
+            _isCpuActive.value = ok
+            TurboSpaceManager.showToast(context, if (ok) "CPU Optimization applied" else "CPU Optimization failed")
+            persist(context)
+        } finally {
+            _isCpuLoading.value = false
+        }
+    }
+
+    suspend fun startGpuOpt(context: Context) {
+        _isGpuLoading.value = true
+        try {
+            val pkg = _selectedGpuGame.value
+            if (!TurboSpaceManager.isRecognizedGame(context, pkg)) {
+                TurboSpaceManager.showToast(context, "Select a game for GPU Optimization")
+                return
+            }
+            val outcome = TurboSpaceManager.reduceGpuLoad(context, pkg, "0.9")
+            val ok = outcome != TurboSpaceManager.CommandOutcome.BOTH_FAILED
+            _isGpuActive.value = ok
+            TurboSpaceManager.showToast(context, if (ok) "GPU Optimization applied" else "GPU Optimization failed")
+            persist(context)
+        } finally {
+            _isGpuLoading.value = false
+        }
+    }
+
+    suspend fun startGameSession(context: Context): Boolean {
+        if (_selectedGame.value == "NO TARGET SELECTED" ||
+            !TurboSpaceManager.isRecognizedGame(context, _selectedGame.value)
+        ) {
+            TurboSpaceManager.showToast(context, "Select a supported game first")
+            return false
+        }
+
+        if (_isSessionActive.value) {
+            TurboSpaceManager.showToast(context, "A Game Session is already active; press RESET first")
+            return false
+        }
+
+        _isSessionStarting.value = true
+        try {
+            val game = _selectedGame.value
+            val features = _selectedFeatures.value
+
+            // Snapshot every stateful feature BEFORE any state-changing command is executed.
+            TurboSpaceManager.captureAndSaveSessionSnapshot(context, game, features)
+
+            val ok = TurboSpaceManager.applySelectedSessionFeatures(context, game, features)
+            _isSessionActive.value = true
+            TurboSpaceManager.showToast(
+                context,
+                if (ok) "Game Session started" else "Game Session started with some feature errors"
+            )
+            return true
+        } finally {
+            _isSessionStarting.value = false
+        }
+    }
+
+    suspend fun resetSession(context: Context): RestoreResult {
+        _isResetting.value = true
+        return try {
+            val result = TurboSpaceManager.restoreSavedSession(context)
+            _isSessionActive.value = false
+            TurboSpaceManager.showToast(
+                context,
+                if (result.success) "Original game session state restored"
+                else "Reset completed with warnings"
+            )
+            result
+        } finally {
+            _isResetting.value = false
+        }
+    }
+
+    suspend fun runFeatureFromOverlay(context: Context, feature: PerformanceFeature) {
+        if (feature.stateful) {
+            TurboSpaceManager.showToast(context, "${feature.title} is controlled by the current Game Session")
+            return
+        }
+        val ok = TurboSpaceManager.runActionFeature(context, feature)
+        TurboSpaceManager.showToast(context, if (ok) "${feature.title} applied" else "${feature.title} failed")
+    }
+
+    private fun persist(context: Context) {
+        TurboSpaceManager.saveAppState(
+            context = context,
+            selectedGame = _selectedGame.value,
+            selectedFeatureIds = _selectedFeatures.value.toIds(),
+            cpuApps = _selectedCpuApps.value,
+            gpuGame = _selectedGpuGame.value,
+            cpuActive = _isCpuActive.value,
+            gpuActive = _isGpuActive.value
+        )
+    }
+}
+
+// ============================================================================
+// 6. HARDWARE MONITOR FOR HUD
+// ============================================================================
+class SystemMonitorEngine(private val context: Context) {
+    val currentCpuUsage = mutableStateOf("N/A")
+    val currentRamUsage = mutableStateOf("N/A")
+    val currentTemperature = mutableStateOf("N/A")
+
+    suspend fun update() = withContext(Dispatchers.IO) {
+        updateRam()
+        updateCpu()
+        updateTemperature()
+    }
+
+    private fun updateRam() {
+        try {
+            val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val mem = ActivityManager.MemoryInfo()
+            manager.getMemoryInfo(mem)
+            val total = mem.totalMem / (1024 * 1024)
+            val avail = mem.availMem / (1024 * 1024)
+            currentRamUsage.value = "${total - avail} MB / $total MB"
+        } catch (_: Exception) {
+            currentRamUsage.value = "N/A"
+        }
+    }
+
+    private suspend fun updateCpu() = withContext(Dispatchers.IO) {
+        if (!TurboSpaceManager.isShizukuAvailableAndGranted()) {
+            currentCpuUsage.value = "N/A"
+            return@withContext
+        }
+        try {
+            val output = TurboSpaceManager.executeCommandCapture(context, "cat /proc/stat")
+            val line = output.lineSequence().firstOrNull { it.startsWith("cpu ") }
+            if (line == null) {
+                currentCpuUsage.value = "N/A"
+                return@withContext
+            }
+            val values = line.trim().split("\\s+".toRegex()).drop(1).mapNotNull { it.toLongOrNull() }
+            if (values.size >= 4) {
+                val total = values.sum()
+                val idle = values[3]
+                currentCpuUsage.value = "$idle / $total"
+            }
+        } catch (_: Exception) {
+            currentCpuUsage.value = "N/A"
+        }
+    }
+
+    private fun updateTemperature() {
+        val temp = try {
+            (0..9).asSequence()
+                .mapNotNull { zone ->
+                    try {
+                        java.io.File("/sys/class/thermal/thermal_zone$zone/temp")
+                            .takeIf { it.canRead() }
+                            ?.readText()
+                            ?.trim()
+                            ?.toLongOrNull()
+                    } catch (_: Exception) { null }
+                }
+                .map { raw -> if (raw > 1000) raw / 1000.0 else raw.toDouble() }
+                .filter { it > 0 && it < 150 }
+                .maxOrNull()
+        } catch (_: Exception) { null }
+        currentTemperature.value = if (temp == null) "N/A" else String.format("%.1f°C", temp)
+    }
+}
+
+// ============================================================================
+// 7. SHIZUKU / COMMAND MANAGER
+// ============================================================================
+object TurboSpaceManager {
+    private const val PREFS_NAME = "TurboSpaceState"
+    private const val COMMAND_TIMEOUT_MS = 10000L
+    private const val APPS_DELIMITER = "||"
+    private const val FEATURE_DELIMITER = "|"
+
+    private const val KEY_SELECTED_GAME = "SELECTED_GAME"
+    private const val KEY_SELECTED_FEATURES = "SELECTED_FEATURES"
+    private const val KEY_CPU_APPS = "CPU_APPS"
+    private const val KEY_GPU_GAME = "GPU_GAME"
+    private const val KEY_CPU_ACTIVE = "CPU_ACTIVE"
+    private const val KEY_GPU_ACTIVE = "GPU_ACTIVE"
+
+    private const val KEY_BG_URI = "HOME_BG_URI"
+    private const val KEY_BG_KIND = "HOME_BG_KIND"
+
+    private const val KEY_SESSION_ACTIVE = "SESSION_ACTIVE"
+    private const val KEY_SESSION_GAME = "SESSION_GAME"
+    private const val KEY_SESSION_GAME_MODE = "SESSION_GAME_MODE"
+    private const val KEY_SESSION_THERMAL = "SESSION_THERMAL"
+    private const val KEY_SESSION_PROCESS = "SESSION_PROCESS"
+    private const val KEY_SESSION_IDLE = "SESSION_IDLE"
+    private const val KEY_SESSION_STATEFUL_FEATURES = "SESSION_STATEFUL_FEATURES"
+
+    data class SavedAppState(
+        val selectedGame: String,
+        val selectedFeatureIds: Set<String>,
+        val cpuApps: Set<String>,
+        val gpuGame: String,
+        val cpuActive: Boolean,
+        val gpuActive: Boolean
+    )
+
+    data class SavedBackground(val uri: String?, val kind: String?)
+
+    enum class CommandOutcome { PRIMARY_SUCCESS, FALLBACK_SUCCESS, BOTH_FAILED }
+
+    private fun prefs(context: Context): SharedPreferences =
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    fun loadAppState(context: Context): SavedAppState {
+        val p = prefs(context)
+        fun readApps(key: String): Set<String> {
+            val raw = p.getString(key, "") ?: ""
+            return if (raw.isBlank()) emptySet()
+            else raw.split(APPS_DELIMITER).filter { it.isNotBlank() }.toSet()
+        }
+        val rawFeatures = p.getString(KEY_SELECTED_FEATURES, "") ?: ""
+        val featureIds = if (rawFeatures.isBlank()) emptySet() else rawFeatures.split(FEATURE_DELIMITER).toSet()
+        return SavedAppState(
+            selectedGame = p.getString(KEY_SELECTED_GAME, "NO TARGET SELECTED") ?: "NO TARGET SELECTED",
+            selectedFeatureIds = featureIds,
+            cpuApps = readApps(KEY_CPU_APPS),
+            gpuGame = p.getString(KEY_GPU_GAME, "NO TARGET SELECTED") ?: "NO TARGET SELECTED",
+            cpuActive = p.getBoolean(KEY_CPU_ACTIVE, false),
+            gpuActive = p.getBoolean(KEY_GPU_ACTIVE, false)
+        )
+    }
+
+    fun saveAppState(
+        context: Context,
+        selectedGame: String,
+        selectedFeatureIds: Set<String>,
+        cpuApps: Set<String>,
+        gpuGame: String,
+        cpuActive: Boolean,
+        gpuActive: Boolean
+    ) {
+        prefs(context).edit()
+            .putString(KEY_SELECTED_GAME, selectedGame)
+            .putString(KEY_SELECTED_FEATURES, selectedFeatureIds.joinToString(FEATURE_DELIMITER))
+            .putString(KEY_CPU_APPS, cpuApps.joinToString(APPS_DELIMITER))
+            .putString(KEY_GPU_GAME, gpuGame)
+            .putBoolean(KEY_CPU_ACTIVE, cpuActive)
+            .putBoolean(KEY_GPU_ACTIVE, gpuActive)
+            .apply()
+    }
+
+    fun saveBackground(context: Context, uri: Uri?, kind: String?) {
+        prefs(context).edit()
+            .putString(KEY_BG_URI, uri?.toString())
+            .putString(KEY_BG_KIND, kind)
+            .apply()
+    }
+
+    fun loadBackground(context: Context): SavedBackground = SavedBackground(
+        uri = prefs(context).getString(KEY_BG_URI, null),
+        kind = prefs(context).getString(KEY_BG_KIND, null)
+    )
+
+    fun hasSavedSession(context: Context): Boolean = prefs(context).getBoolean(KEY_SESSION_ACTIVE, false)
+
+    fun isShizukuAvailableAndGranted(): Boolean {
+        return try {
+            Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun requestShizukuPermission() {
+        try {
+            if (Shizuku.pingBinder() && Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                Shizuku.requestPermission(1001)
+            }
+        } catch (_: Exception) { }
+    }
+
+    fun addPermissionResultListener(
+        onResult: (granted: Boolean) -> Unit
+    ): Shizuku.OnRequestPermissionResultListener {
+        val listener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+            if (requestCode == 1001) onResult(grantResult == PackageManager.PERMISSION_GRANTED)
+        }
+        Shizuku.addRequestPermissionResultListener(listener)
+        return listener
+    }
+
+    fun removePermissionResultListener(listener: Shizuku.OnRequestPermissionResultListener) {
+        Shizuku.removeRequestPermissionResultListener(listener)
+    }
+
+    fun newShizukuProcess(cmd: Array<String>, env: Array<String>? = null, dir: String? = null): Process {
+        val method = Shizuku::class.java.getDeclaredMethod(
+            "newProcess",
+            Array<String>::class.java,
+            Array<String>::class.java,
+            String::class.java
+        )
+        method.isAccessible = true
+        return method.invoke(null, cmd, env, dir) as Process
+    }
+
+    fun showToast(context: Context, message: String) {
+        Toast.makeText(context.applicationContext, message, Toast.LENGTH_SHORT).show()
+    }
+
+    suspend fun executeCommandDetailed(
+        context: Context,
+        primaryCmd: String,
+        fallbackCmd: String = "",
+        timeoutMs: Long = COMMAND_TIMEOUT_MS
+    ): CommandOutcome = withContext(Dispatchers.IO) {
+        if (!isShizukuAvailableAndGranted()) return@withContext CommandOutcome.BOTH_FAILED
+        if (runSingleCommand(primaryCmd, timeoutMs)) return@withContext CommandOutcome.PRIMARY_SUCCESS
+        if (fallbackCmd.isNotBlank() && runSingleCommand(fallbackCmd, timeoutMs)) {
+            return@withContext CommandOutcome.FALLBACK_SUCCESS
+        }
+        CommandOutcome.BOTH_FAILED
+    }
+
+    suspend fun executeCommandCapture(context: Context, command: String): String =
+        withContext(Dispatchers.IO) {
+            if (!isShizukuAvailableAndGranted()) return@withContext ""
+            runSingleCommandCapture(command)
+        }
+
+    private suspend fun runSingleCommand(cmd: String, timeoutMs: Long): Boolean = withContext(Dispatchers.IO) {
+        var process: Process? = null
+        try {
+            process = newShizukuProcess(arrayOf("sh", "-c", cmd))
+            val code = withTimeoutOrNull(timeoutMs) {
+                runInterruptible { process.waitFor() }
+            }
+            if (code == null) {
+                process.destroy()
+                false
+            } else {
+                code == 0
+            }
+        } catch (_: Exception) {
+            process?.destroy()
+            false
+        }
+    }
+
+    private fun runSingleCommandCapture(cmd: String): String {
+        var process: Process? = null
+        return try {
+            process = newShizukuProcess(arrayOf("sh", "-c", cmd))
+            val out = process.inputStream.bufferedReader().readText()
+            process.waitFor()
+            out
+        } catch (_: Exception) {
+            ""
+        } finally {
+            process?.destroy()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // GAME IDENTIFICATION
+    // ------------------------------------------------------------------
+    fun isRecognizedGame(context: Context, packageName: String): Boolean {
+        if (packageName.isBlank() || packageName == "NO TARGET SELECTED" || packageName == context.packageName) return false
+        return getGameApps(context).any { it.packageName == packageName }
+    }
+
+    fun getGameApps(context: Context): List<ApplicationInfo> {
+        val pm = context.packageManager
+        return try {
+            pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                .filter { info ->
+                    if (info.packageName == context.packageName) return@filter false
+                    if ((info.flags and ApplicationInfo.FLAG_SYSTEM) != 0) return@filter false
+                    if ((info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) return@filter false
+
+                    val gameCategory = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        info.category == ApplicationInfo.CATEGORY_GAME
+                    } else {
+                        @Suppress("DEPRECATION")
+                        (info.flags and ApplicationInfo.FLAG_IS_GAME) != 0
+                    }
+                    gameCategory && pm.getLaunchIntentForPackage(info.packageName) != null
+                }
+                .sortedBy { pm.getApplicationLabel(it).toString().lowercase() }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun getThirdPartyApps(context: Context): List<ApplicationInfo> {
+        val pm = context.packageManager
+        return try {
+            pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                .filter { info ->
+                    info.packageName != context.packageName &&
+                        (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
+                        (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
+                }
+                .sortedBy { pm.getApplicationLabel(it).toString().lowercase() }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun getAppLabel(context: Context, packageName: String): String {
+        return try {
+            context.packageManager.getApplicationLabel(
+                context.packageManager.getApplicationInfo(packageName, 0)
+            ).toString()
+        } catch (_: Exception) {
+            packageName
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // CPU / GPU IMPLEMENTATIONS KEPT FROM THE EXISTING APP
+    // ------------------------------------------------------------------
+    suspend fun reduceCpuLoad(context: Context, packageName: String): CommandOutcome {
+        if (packageName == "NO TARGET SELECTED") return CommandOutcome.BOTH_FAILED
+        val primary = "cmd activity set-inactive $packageName true"
+        val fallback = "cmd appops set $packageName RUN_IN_BACKGROUND deny"
+        return executeCommandDetailed(context, primary, fallback)
+    }
+
+    suspend fun reduceGpuLoad(context: Context, packageName: String, ratio: String): CommandOutcome {
+        if (packageName == "NO TARGET SELECTED") return CommandOutcome.BOTH_FAILED
+        val primary = "cmd game downscale $packageName $ratio"
+        return executeCommandDetailed(context, primary)
+    }
+
+    // ------------------------------------------------------------------
+    // NEW SESSION FEATURE COMMANDS
+    // ------------------------------------------------------------------
+    suspend fun applySelectedSessionFeatures(
+        context: Context,
+        gamePackage: String,
+        features: Set<PerformanceFeature>
+    ): Boolean {
+        var allOk = true
+        features.forEach { feature ->
+            val ok = when (feature) {
+                PerformanceFeature.GAME_PERFORMANCE ->
+                    executeCommandDetailed(context, "cmd game mode performance $gamePackage") != CommandOutcome.BOTH_FAILED
+                PerformanceFeature.THERMAL_CONTROL ->
+                    executeCommandDetailed(context, "cmd thermalservice override-status 0") != CommandOutcome.BOTH_FAILED
+                PerformanceFeature.PROCESS_CONTROL ->
+                    executeCommandDetailed(context, "cmd activity set-process-limit 2") != CommandOutcome.BOTH_FAILED
+                PerformanceFeature.IDLE_CONTROL ->
+                    executeCommandDetailed(context, "cmd deviceidle force-idle light") != CommandOutcome.BOTH_FAILED
+                else -> runActionFeature(context, feature)
+            }
+            if (!ok) allOk = false
+        }
+        return allOk
+    }
+
+    suspend fun runActionFeature(context: Context, feature: PerformanceFeature): Boolean {
+        val command = when (feature) {
+            PerformanceFeature.RESOURCE_CLEANUP -> "cmd activity purge-process-resources"
+            PerformanceFeature.GFX_BOOST -> "cmd activity boost-gfx"
+            PerformanceFeature.APP_OPTIMIZATION -> "cmd package bg-dexopt-job"
+            PerformanceFeature.INPUT_CONFIGURATION -> "cmd inputflinger reload-config"
+            PerformanceFeature.TRIM_CACHE -> "pm trim-caches 999G"
+            else -> return false
+        }
+        return executeCommandDetailed(context, command) != CommandOutcome.BOTH_FAILED
+    }
+
+    // ------------------------------------------------------------------
+    // ORIGINAL STATE CAPTURE / RESTORE
+    // ------------------------------------------------------------------
+    suspend fun captureAndSaveSessionSnapshot(
+        context: Context,
+        gamePackage: String,
+        features: Set<PerformanceFeature>
+    ) {
+        val statefulFeatureIds = features.filter { it.stateful }.toIds()
+        if (statefulFeatureIds.isEmpty()) {
+            prefs(context).edit()
+                .putBoolean(KEY_SESSION_ACTIVE, true)
+                .putString(KEY_SESSION_STATEFUL_FEATURES, "")
+                .apply()
+            return
+        }
+
+        val previousGameMode = if (PerformanceFeature.GAME_PERFORMANCE in features) {
+            queryGameMode(context, gamePackage)
+        } else null
+
+        val previousThermal = if (PerformanceFeature.THERMAL_CONTROL in features) {
+            queryThermalOverride(context)
+        } else null
+
+        val previousProcess = if (PerformanceFeature.PROCESS_CONTROL in features) {
+            queryProcessLimit(context)
+        } else null
+
+        val previousIdle = if (PerformanceFeature.IDLE_CONTROL in features) {
+            queryForcedIdle(context)
+        } else null
+
+        prefs(context).edit()
+            .putBoolean(KEY_SESSION_ACTIVE, true)
+            .putString(KEY_SESSION_GAME, gamePackage)
+            .putString(KEY_SESSION_STATEFUL_FEATURES, statefulFeatureIds.joinToString(FEATURE_DELIMITER))
+            .putString(KEY_SESSION_GAME_MODE, previousGameMode)
+            .putInt(KEY_SESSION_THERMAL, previousThermal ?: Int.MIN_VALUE)
+            .putString(KEY_SESSION_PROCESS, previousProcess)
+            .putString(KEY_SESSION_IDLE, previousIdle?.toString())
+            .apply()
+    }
+
+    suspend fun restoreSavedSession(context: Context): RestoreResult {
+        val p = prefs(context)
+        if (!p.getBoolean(KEY_SESSION_ACTIVE, false)) {
+            return RestoreResult(success = true)
+        }
+
+        val gamePackage = p.getString(KEY_SESSION_GAME, "") ?: ""
+        val statefulFeatureIds = (p.getString(KEY_SESSION_STATEFUL_FEATURES, "") ?: "")
+            .split(FEATURE_DELIMITER)
+            .filter { it.isNotBlank() }
+            .toSet()
+        val statefulFeatures = statefulFeatureIds.toPerformanceFeatures()
+        if (statefulFeatures.isEmpty()) {
+            p.edit()
+                .remove(KEY_SESSION_GAME)
+                .remove(KEY_SESSION_STATEFUL_FEATURES)
+                .remove(KEY_SESSION_GAME_MODE)
+                .remove(KEY_SESSION_THERMAL)
+                .remove(KEY_SESSION_PROCESS)
+                .remove(KEY_SESSION_IDLE)
+                .putBoolean(KEY_SESSION_ACTIVE, false)
+                .apply()
+            return RestoreResult(success = true)
+        }
+
+        val previousGameMode = p.getString(KEY_SESSION_GAME_MODE, null)
+        val thermalRaw = p.getInt(KEY_SESSION_THERMAL, Int.MIN_VALUE)
+        val previousThermal = thermalRaw.takeUnless { it == Int.MIN_VALUE }
+        val previousProcess = p.getString(KEY_SESSION_PROCESS, null)
+        val previousIdle = when ((p.getString(KEY_SESSION_IDLE, null) ?: "").lowercase()) {
+            "true" -> true
+            "false" -> false
+            else -> null
+        }
+
+        var allOk = true
+        val warnings = mutableListOf<String>()
+
+        if (PerformanceFeature.GAME_PERFORMANCE in statefulFeatures && gamePackage.isNotBlank() && previousGameMode != null) {
+            val ok = executeCommandDetailed(
+                context,
+                "cmd game mode $previousGameMode $gamePackage"
+            ) != CommandOutcome.BOTH_FAILED
+            if (!ok) allOk = false
+        } else if (PerformanceFeature.GAME_PERFORMANCE in statefulFeatures && gamePackage.isNotBlank() && previousGameMode == null) {
+            warnings += "Previous Game Mode could not be detected; it was left unchanged."
+        }
+
+        if (PerformanceFeature.THERMAL_CONTROL in statefulFeatures && previousThermal != null) {
+            val resetOk = executeCommandDetailed(context, "cmd thermalservice reset") != CommandOutcome.BOTH_FAILED
+            if (!resetOk) {
+                allOk = false
+            } else if (previousThermal >= 0) {
+                val reapplyOk = executeCommandDetailed(
+                    context,
+                    "cmd thermalservice override-status $previousThermal"
+                ) != CommandOutcome.BOTH_FAILED
+                if (!reapplyOk) allOk = false
+            }
+        } else if (PerformanceFeature.THERMAL_CONTROL in statefulFeatures && p.contains(KEY_SESSION_THERMAL)) {
+            // The requested reset command is used only when the original query was unavailable.
+            val ok = executeCommandDetailed(context, "cmd thermalservice reset") != CommandOutcome.BOTH_FAILED
+            if (!ok) allOk = false
+            warnings += "Original Thermal Override state was not readable; the system reset command was used."
+        }
+
+        if (PerformanceFeature.PROCESS_CONTROL in statefulFeatures && previousProcess != null) {
+            val cmd = if (previousProcess.equals("default", ignoreCase = true)) {
+                "cmd activity set-process-limit default"
+            } else {
+                "cmd activity set-process-limit $previousProcess"
+            }
+            val ok = executeCommandDetailed(context, cmd) != CommandOutcome.BOTH_FAILED
+            if (!ok) allOk = false
+        } else if (PerformanceFeature.PROCESS_CONTROL in statefulFeatures) {
+            warnings += "Original Process Limit was not readable; no blind replacement value was applied."
+        }
+
+        if (PerformanceFeature.IDLE_CONTROL in statefulFeatures && previousIdle != null) {
+            val cmd = if (previousIdle) {
+                "cmd deviceidle force-idle light"
+            } else {
+                "cmd deviceidle unforce"
+            }
+            val ok = executeCommandDetailed(context, cmd) != CommandOutcome.BOTH_FAILED
+            if (!ok) allOk = false
+        } else if (PerformanceFeature.IDLE_CONTROL in statefulFeatures) {
+            warnings += "Original Idle state was not readable; no blind replacement state was applied."
+        }
+
+        p.edit()
+            .remove(KEY_SESSION_GAME)
+            .remove(KEY_SESSION_STATEFUL_FEATURES)
+            .remove(KEY_SESSION_GAME_MODE)
+            .remove(KEY_SESSION_THERMAL)
+            .remove(KEY_SESSION_PROCESS)
+            .remove(KEY_SESSION_IDLE)
+            .putBoolean(KEY_SESSION_ACTIVE, false)
+            .apply()
+
+        return RestoreResult(allOk, warnings)
+    }
+
+    private suspend fun queryGameMode(context: Context, packageName: String): String? {
+        val output = executeCommandCapture(context, "cmd game mode get $packageName")
+        val lower = output.lowercase()
+        return when {
+            Regex("current[^\\n]*(performance)", RegexOption.IGNORE_CASE).containsMatchIn(output) -> "performance"
+            Regex("current[^\\n]*(battery)", RegexOption.IGNORE_CASE).containsMatchIn(output) -> "battery"
+            Regex("current[^\\n]*(standard|balanced)", RegexOption.IGNORE_CASE).containsMatchIn(output) -> "standard"
+            lower.trim() == "performance" -> "performance"
+            lower.trim() == "battery" -> "battery"
+            lower.trim() == "standard" || lower.trim() == "balanced" -> "standard"
+            else -> null
+        }
+    }
+
+    private suspend fun queryProcessLimit(context: Context): String? {
+        val output = executeCommandCapture(context, "cmd activity get-process-limit")
+        val match = Regex("(?i)(?:process.?limit|limit)\\s*[:=]\\s*(default|-?\\d+)").find(output)
+        if (match != null) return match.groupValues[1]
+        val trimmed = output.trim()
+        if (trimmed.equals("default", true)) return "default"
+        return Regex("(?:^|\\s)(\\d+)(?:\\s|$)").find(trimmed)?.groupValues?.get(1)
+    }
+
+    private suspend fun queryThermalOverride(context: Context): Int? {
+        val output = executeCommandCapture(context, "dumpsys thermalservice")
+        val match = Regex("(?i)mOverrideStatus\\s*[:=]\\s*(-?\\d+)").find(output)
+            ?: Regex("(?i)override.?status\\s*[:=]\\s*(-?\\d+)").find(output)
+        return match?.groupValues?.get(1)?.toIntOrNull()
+    }
+
+    private suspend fun queryForcedIdle(context: Context): Boolean? {
+        val output = executeCommandCapture(context, "dumpsys deviceidle")
+        Regex("(?i)mForceIdle\\s*[=:]\\s*(true|false)").find(output)?.let {
+            return it.groupValues[1].equals("true", true)
+        }
+        Regex("(?i)mForceLevel\\s*[=:]\\s*(\\d+)").find(output)?.let {
+            return it.groupValues[1].toIntOrNull()?.let { value -> value != 0 }
+        }
+        return null
+    }
+}
+
+// ============================================================================
+// 8. OVERLAY SERVICE
+// ============================================================================
+class GameSpaceOverlayService : LifecycleService(), SavedStateRegistryOwner, ViewModelStoreOwner {
+    private lateinit var windowManager: WindowManager
+    private lateinit var composeView: ComposeView
+    private lateinit var overlayParams: WindowManager.LayoutParams
+    private val savedStateRegistryController = SavedStateRegistryController.create(this)
+    private val _viewModelStore = ViewModelStore()
+
+    override val savedStateRegistry: SavedStateRegistry
+        get() = savedStateRegistryController.savedStateRegistry
+
+    override val viewModelStore: ViewModelStore
+        get() = _viewModelStore
+
+    override fun onCreate() {
+        super.onCreate()
+        savedStateRegistryController.performRestore(null)
+        startForegroundServiceWithNotification()
+
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        composeView = ComposeView(this).apply {
+            setViewTreeLifecycleOwner(this@GameSpaceOverlayService)
+            setViewTreeViewModelStoreOwner(this@GameSpaceOverlayService)
+            setViewTreeSavedStateRegistryOwner(this@GameSpaceOverlayService)
+            setContent {
+                TurboSpaceGameBar(
+                    onDragOverlay = { dx, dy -> moveOverlayBy(dx, dy) },
+                    onClose = { stopSelf() },
+                    onReset = {
+                        // RESET restores state; CLOSE never does.
+                        kotlinx.coroutines.MainScope().launch {
+                            TurboSpaceRepository.resetSession(this@GameSpaceOverlayService)
+                            stopSelf()
+                        }
+                    }
+                )
+            }
+        }
+
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        overlayParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            val dm = resources.displayMetrics
+            val targetWidth = (minOf(dm.widthPixels * 0.92f, 1080f)).toInt()
+            width = targetWidth
+            x = ((dm.widthPixels - targetWidth) / 2f).toInt().coerceAtLeast(0)
+            y = (dm.heightPixels * 0.12f).toInt()
+        }
+
+        try {
+            windowManager.addView(composeView, overlayParams)
+        } catch (_: Exception) {
+            Toast.makeText(this, "Failed to display Game Bar", Toast.LENGTH_SHORT).show()
+            stopSelf()
+        }
+    }
+
+    private fun moveOverlayBy(dx: Float, dy: Float) {
+        if (!::composeView.isInitialized || !::overlayParams.isInitialized) return
+        val dm = resources.displayMetrics
+        val maxX = (dm.widthPixels - composeView.width).coerceAtLeast(0)
+        val maxY = (dm.heightPixels - composeView.height).coerceAtLeast(0)
+        overlayParams.x = (overlayParams.x + dx.toInt()).coerceIn(0, maxX)
+        overlayParams.y = (overlayParams.y + dy.toInt()).coerceIn(0, maxY)
+        try { windowManager.updateViewLayout(composeView, overlayParams) } catch (_: Exception) { }
+    }
+
+    private fun startForegroundServiceWithNotification() {
+        val channelId = "turbo_overlay_channel"
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            manager.createNotificationChannel(
+                NotificationChannel(channelId, "Turbo Space Game Bar", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val notification: Notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Turbo Space Game Session")
+            .setContentText("Game Bar is active")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(1001, notification)
+        }
+    }
+
+    override fun onDestroy() {
+        try {
+            if (::composeView.isInitialized) windowManager.removeView(composeView)
+        } catch (_: Exception) { }
+        _viewModelStore.clear()
+        super.onDestroy()
+    }
+}
+
+// ============================================================================
+// 9. ROOT APP / SCREEN NAVIGATION
+// ============================================================================
+private enum class TurboScreen { HOME, GAMES, SETTINGS }
+
+@Composable
+fun TurboSpaceApp() {
+    val context = LocalContext.current
+    var screen by remember { mutableStateOf(TurboScreen.HOME) }
+    var isShizukuReady by remember { mutableStateOf(TurboSpaceManager.isShizukuAvailableAndGranted()) }
+    var backgroundRefreshKey by remember { mutableStateOf(0) }
+    val coroutineScope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        TurboSpaceRepository.restoreFromPrefs(context)
+    }
+
+    DisposableEffect(Unit) {
+        val listener = TurboSpaceManager.addPermissionResultListener { granted ->
+            isShizukuReady = granted
+        }
+        onDispose { TurboSpaceManager.removePermissionResultListener(listener) }
+    }
+
+    val selectedGame by TurboSpaceRepository.selectedGame.collectAsState()
+    val isSessionStarting by TurboSpaceRepository.isSessionStarting.collectAsState()
+    val isSessionActive by TurboSpaceRepository.isSessionActive.collectAsState()
+    val isResetting by TurboSpaceRepository.isResetting.collectAsState()
+
+    var pendingStartAfterPermission by remember { mutableStateOf(false) }
+
+    val backgroundPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) { }
+            val mime = context.contentResolver.getType(uri).orEmpty()
+            val kind = when {
+                mime.startsWith("video/") -> "video"
+                mime.equals("image/gif", true) -> "animated"
+                else -> "image"
+            }
+            TurboSpaceManager.saveBackground(context, uri, kind)
+            backgroundRefreshKey++
+        }
+    }
+
+    val overlayPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        if (Settings.canDrawOverlays(context) && pendingStartAfterPermission) {
+            pendingStartAfterPermission = false
+            coroutineScope.launch {
+                startSessionAndLaunch(
+                    context = context,
+                    isShizukuReady = isShizukuReady,
+                    onSessionStarted = {
+                        ContextCompat.startForegroundService(
+                            context,
+                            Intent(context, GameSpaceOverlayService::class.java)
+                        )
+                    }
+                )
+            }
+        }
+    }
+
+    fun requestStart() {
+        if (selectedGame == "NO TARGET SELECTED") {
+            Toast.makeText(context, "Select a game first", Toast.LENGTH_SHORT).show()
+            screen = TurboScreen.GAMES
+            return
+        }
+        if (!isShizukuReady) {
+            Toast.makeText(context, "Shizuku permission is required", Toast.LENGTH_LONG).show()
+            TurboSpaceManager.requestShizukuPermission()
+            return
+        }
+        if (!Settings.canDrawOverlays(context)) {
+            pendingStartAfterPermission = true
+            overlayPermissionLauncher.launch(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:${context.packageName}")
+                )
+            )
+            return
+        }
+        coroutineScope.launch {
+            startSessionAndLaunch(
+                context = context,
+                isShizukuReady = isShizukuReady,
+                onSessionStarted = {
+                    ContextCompat.startForegroundService(
+                        context,
+                        Intent(context, GameSpaceOverlayService::class.java)
+                    )
+                }
+            )
+        }
+    }
+
+    fun resetNow() {
+        coroutineScope.launch {
+            TurboSpaceRepository.resetSession(context)
+            context.stopService(Intent(context, GameSpaceOverlayService::class.java))
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(TurboColors.DarkBackground)) {
+        HomeBackground(backgroundRefreshKey)
+
+        when (screen) {
+            TurboScreen.HOME -> HomeScreen(
+                selectedGame = selectedGame,
+                isShizukuReady = isShizukuReady,
+                isSessionStarting = isSessionStarting,
+                isSessionActive = isSessionActive,
+                isResetting = isResetting,
+                onSettings = { screen = TurboScreen.SETTINGS },
+                onGames = { screen = TurboScreen.GAMES },
+                onAddBackground = { backgroundPicker.launch(arrayOf("image/*", "video/*")) },
+                onStart = ::requestStart,
+                onReset = ::resetNow,
+                onShizuku = { TurboSpaceManager.requestShizukuPermission() }
+            )
+
+            TurboScreen.GAMES -> GameSelectionScreen(
+                selectedGame = selectedGame,
+                onBack = { screen = TurboScreen.HOME },
+                onGameSelected = {
+                    TurboSpaceRepository.setSelectedGame(context, it)
+                    screen = TurboScreen.HOME
+                }
+            )
+
+            TurboScreen.SETTINGS -> PerformanceSettingsScreen(
+                isShizukuReady = isShizukuReady,
+                onBack = { screen = TurboScreen.HOME }
+            )
+        }
+    }
+}
+
+private suspend fun startSessionAndLaunch(
+    context: Context,
+    isShizukuReady: Boolean,
+    onSessionStarted: () -> Unit
+) {
+    if (!isShizukuReady) {
+        TurboSpaceManager.showToast(context, "Shizuku permission is required")
+        return
+    }
+    val started = TurboSpaceRepository.startGameSession(context)
+    if (!started) return
+
+    val pkg = TurboSpaceRepository.selectedGame.value
+    val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
+    if (launchIntent == null) {
+        TurboSpaceRepository.resetSession(context)
+        TurboSpaceManager.showToast(context, "Could not launch the selected game; original state restored")
+        return
+    }
+
+    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    context.startActivity(launchIntent)
+    onSessionStarted()
+}
+
+// ============================================================================
+// 10. HOME SCREEN
+// ============================================================================
+@Composable
+private fun HomeScreen(
+    selectedGame: String,
+    isShizukuReady: Boolean,
+    isSessionStarting: Boolean,
+    isSessionActive: Boolean,
+    isResetting: Boolean,
+    onSettings: () -> Unit,
+    onGames: () -> Unit,
+    onAddBackground: () -> Unit,
+    onStart: () -> Unit,
+    onReset: () -> Unit,
+    onShizuku: () -> Unit
+) {
+    val context = LocalContext.current
+    val label = remember(selectedGame) {
+        if (selectedGame == "NO TARGET SELECTED") "NO GAME SELECTED"
+        else TurboSpaceManager.getAppLabel(context, selectedGame)
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(TurboColors.DarkBackground.copy(alpha = 0.68f))
+            .padding(18.dp)
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                GamingTopButton("⚙️ Settings", onSettings, Modifier.widthIn(min = 170.dp))
+                Spacer(Modifier.width(10.dp))
+                GamingTopButton("＋ Add Background", onAddBackground, Modifier.widthIn(min = 190.dp))
+            }
+
+            Spacer(Modifier.height(22.dp))
+
+            Box(modifier = Modifier.fillMaxSize()) {
+                GamingTopButton(
+                    text = "🎮 Games",
+                    onClick = onGames,
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .width(150.dp)
+                        .height(58.dp)
+                )
+
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .fillMaxWidth(0.64f),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        "TURBO SPACE",
+                        color = TurboColors.BrightRed,
+                        fontSize = 31.sp,
+                        fontWeight = FontWeight.Black
+                    )
+                    Spacer(Modifier.height(10.dp))
+
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = CutCornerShape(18.dp),
+                        color = TurboColors.HudObsidian.copy(alpha = 0.88f),
+                        border = BorderStroke(1.dp, TurboColors.HudCyan.copy(alpha = 0.55f))
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(18.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text("SELECTED GAME", color = TurboColors.TextGray, fontSize = 12.sp)
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                label,
+                                color = Color.White,
+                                fontSize = 21.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center
+                            )
+                            if (!isShizukuReady) {
+                                Spacer(Modifier.height(8.dp))
+                                TextButton(onClick = onShizuku) {
+                                    Text("Grant Shizuku Permission", color = TurboColors.HudCyan)
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(22.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        GamingMainButton(
+                            text = if (isSessionStarting) "STARTING..." else "▶ START",
+                            accent = TurboColors.HudCyan,
+                            enabled = !isSessionStarting && !isSessionActive,
+                            modifier = Modifier.weight(1f),
+                            onClick = onStart
+                        )
+                        GamingMainButton(
+                            text = if (isResetting) "RESETTING..." else "↻ RESET",
+                            accent = TurboColors.HudCrimson,
+                            enabled = !isResetting,
+                            modifier = Modifier.weight(1f),
+                            onClick = onReset
+                        )
+                    }
+
+                    if (isSessionActive) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "GAME SESSION ACTIVE",
+                            color = TurboColors.HudGreen,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GamingTopButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.height(52.dp),
+        shape = CutCornerShape(12.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = TurboColors.HudObsidian.copy(alpha = 0.92f),
+            contentColor = Color.White
+        )
+    ) { Text(text, fontWeight = FontWeight.Bold) }
+}
+
+@Composable
+private fun GamingMainButton(
+    text: String,
+    accent: Color,
+    enabled: Boolean,
+    modifier: Modifier,
+    onClick: () -> Unit
+) {
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier.height(64.dp),
+        shape = CutCornerShape(14.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = accent.copy(alpha = 0.82f),
+            contentColor = Color.White,
+            disabledContainerColor = TurboColors.EngineStopGray,
+            disabledContentColor = Color.White
+        )
+    ) { Text(text, fontSize = 18.sp, fontWeight = FontWeight.Black) }
+}
+
+// ============================================================================
+// 11. SETTINGS SCREEN
+// ============================================================================
+@Composable
+private fun PerformanceSettingsScreen(
+    isShizukuReady: Boolean,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val selectedFeatures by TurboSpaceRepository.selectedFeatures.collectAsState()
+    val selectedCpuApps by TurboSpaceRepository.selectedCpuApps.collectAsState()
+    val selectedGpuGame by TurboSpaceRepository.selectedGpuGame.collectAsState()
+    val cpuActive by TurboSpaceRepository.isCpuActive.collectAsState()
+    val gpuActive by TurboSpaceRepository.isGpuActive.collectAsState()
+    val cpuLoading by TurboSpaceRepository.isCpuLoading.collectAsState()
+    val gpuLoading by TurboSpaceRepository.isGpuLoading.collectAsState()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(TurboColors.DarkBackground.copy(alpha = 0.92f))
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedButton(onClick = onBack) { Text("← Back") }
+            Spacer(Modifier.width(12.dp))
+            Text("Performance Features", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 14.dp, vertical = 4.dp)
+        ) {
+            Text(
+                "Select the features that will be used during each Game Session.",
+                color = TurboColors.TextGray,
+                fontSize = 13.sp
+            )
+            Spacer(Modifier.height(10.dp))
+
+            PerformanceFeature.values().forEach { feature ->
+                FeatureSwitchRow(
+                    feature = feature,
+                    checked = feature in selectedFeatures,
+                    enabled = isShizukuReady,
+                    onCheckedChange = { checked ->
+                        TurboSpaceRepository.setFeatureEnabled(context, feature, checked)
+                    }
+                )
+                Spacer(Modifier.height(8.dp))
+            }
+
+            HorizontalDivider(color = TurboColors.BorderGray)
+            Spacer(Modifier.height(12.dp))
+
+            Text("Existing Optimizations", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+
+            MultiAppActionCard(
+                title = "CPU Optimization",
+                subtitle = "Keep the existing CPU optimization implementation.",
+                selectedApps = selectedCpuApps,
+                isActive = cpuActive,
+                isLoading = cpuLoading,
+                enabled = isShizukuReady,
+                onAppsSelected = { TurboSpaceRepository.setSelectedCpuApps(context, it) },
+                onStart = { coroutineScope.launch { TurboSpaceRepository.startCpuOpt(context) } }
+            )
+
+            Spacer(Modifier.height(10.dp))
+
+            AppActionCard(
+                title = "GPU Optimization",
+                subtitle = "Keep the existing GPU optimization implementation for games.",
+                selectedApp = selectedGpuGame,
+                gamesOnly = true,
+                isActive = gpuActive,
+                isLoading = gpuLoading,
+                enabled = isShizukuReady,
+                onAppSelected = { TurboSpaceRepository.setSelectedGpuGame(context, it) },
+                onStart = { coroutineScope.launch { TurboSpaceRepository.startGpuOpt(context) } }
+            )
+
+            Spacer(Modifier.height(18.dp))
+        }
+    }
+}
+
+@Composable
+private fun FeatureSwitchRow(
+    feature: PerformanceFeature,
+    checked: Boolean,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = if (checked) TurboColors.ActiveRedBg else TurboColors.CardBackground,
+        border = BorderStroke(1.dp, if (checked) TurboColors.BrightRed else TurboColors.BorderGray)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(feature.icon, fontSize = 24.sp)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(feature.title, color = Color.White, fontWeight = FontWeight.Bold)
+                Text(
+                    if (feature.stateful) "Stateful • restored by RESET" else "Action • no fake reset",
+                    color = TurboColors.TextGray,
+                    fontSize = 11.sp
+                )
+            }
+            Switch(checked = checked, enabled = enabled, onCheckedChange = onCheckedChange)
+        }
+    }
+}
+
+// ============================================================================
+// 12. GAMES SCREEN
+// ============================================================================
+@Composable
+private fun GameSelectionScreen(
+    selectedGame: String,
+    onBack: () -> Unit,
+    onGameSelected: (String) -> Unit
+) {
+    val context = LocalContext.current
+    var searchQuery by remember { mutableStateOf("") }
+    val games = remember { TurboSpaceManager.getGameApps(context) }
+    val filtered = remember(searchQuery, games) {
+        if (searchQuery.isBlank()) games
+        else games.filter {
+            TurboSpaceManager.getAppLabel(context, it.packageName)
+                .contains(searchQuery, ignoreCase = true)
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(TurboColors.DarkBackground.copy(alpha = 0.94f))
+            .padding(14.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = onBack) { Text("← Back") }
+            Spacer(Modifier.width(12.dp))
+            Text("🎮 Games", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(
+            value = searchQuery,
+            onValueChange = { searchQuery = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            placeholder = { Text("Search recognized games...") }
+        )
+        Spacer(Modifier.height(10.dp))
+
+        if (games.isEmpty()) {
+            Text(
+                "No recognized games were found. The list only includes launchable packages identified as games by Android application metadata.",
+                color = TurboColors.TextGray,
+                modifier = Modifier.padding(12.dp)
+            )
+        } else if (filtered.isEmpty()) {
+            Text("No matching games.", color = TurboColors.TextGray, modifier = Modifier.padding(12.dp))
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(filtered, key = { it.packageName }) { appInfo ->
+                    val isSelected = appInfo.packageName == selectedGame
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onGameSelected(appInfo.packageName) },
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (isSelected) TurboColors.ActiveRedBg else TurboColors.CardBackground,
+                        border = BorderStroke(1.dp, if (isSelected) TurboColors.BrightRed else TurboColors.BorderGray)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            AppIconImage(appInfo.packageName, Modifier.size(48.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(TurboSpaceManager.getAppLabel(context, appInfo.packageName), color = Color.White, fontWeight = FontWeight.Bold)
+                                Text(appInfo.packageName, color = TurboColors.TextGray, fontSize = 10.sp)
+                            }
+                            if (isSelected) Text("SELECTED", color = TurboColors.HudGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 13. REUSABLE CPU / GPU UI
+// ============================================================================
+@Composable
+private fun MultiAppActionCard(
+    title: String,
+    subtitle: String,
+    selectedApps: Set<String>,
+    isActive: Boolean,
+    isLoading: Boolean,
+    enabled: Boolean,
+    onAppsSelected: (Set<String>) -> Unit,
+    onStart: () -> Unit
+) {
+    var pickerOpen by remember { mutableStateOf(false) }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = if (isActive) TurboColors.ActiveRedBg else TurboColors.CardBackground,
+        border = BorderStroke(1.dp, if (isActive) TurboColors.BrightRed else TurboColors.BorderGray)
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Text(title, color = Color.White, fontWeight = FontWeight.Bold)
+            Text(subtitle, color = TurboColors.TextGray, fontSize = 12.sp)
+            Spacer(Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(TurboColors.DarkBackground.copy(alpha = 0.55f))
+                    .clickable(enabled = enabled) { pickerOpen = true }
+                    .padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (selectedApps.isEmpty()) {
+                    Text("＋ Select apps...", color = TurboColors.TextGray)
+                } else {
+                    selectedApps.take(3).forEach { pkg ->
+                        AppIconImage(pkg, Modifier.size(30.dp))
+                        Spacer(Modifier.width(4.dp))
+                    }
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        if (selectedApps.size == 1) "1 app selected" else "${selectedApps.size} apps selected",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = onStart,
+                enabled = enabled && !isLoading && selectedApps.isNotEmpty(),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (isLoading) "Starting..." else "Start CPU Optimization")
+            }
+        }
+    }
+
+    if (pickerOpen) {
+        MultiAppPickerDialog(
+            currentSelected = selectedApps,
+            onDismiss = { pickerOpen = false },
+            onAppsSelected = {
+                onAppsSelected(it)
+                pickerOpen = false
+            }
+        )
+    }
+}
+
+@Composable
+private fun AppActionCard(
+    title: String,
+    subtitle: String,
+    selectedApp: String,
+    gamesOnly: Boolean,
+    isActive: Boolean,
+    isLoading: Boolean,
+    enabled: Boolean,
+    onAppSelected: (String) -> Unit,
+    onStart: () -> Unit
+) {
+    var pickerOpen by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val selectedLabel = if (selectedApp == "NO TARGET SELECTED") {
+        if (gamesOnly) "Select a game..." else "Select an app..."
+    } else {
+        TurboSpaceManager.getAppLabel(context, selectedApp)
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = if (isActive) TurboColors.ActiveRedBg else TurboColors.CardBackground,
+        border = BorderStroke(1.dp, if (isActive) TurboColors.BrightRed else TurboColors.BorderGray)
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Text(title, color = Color.White, fontWeight = FontWeight.Bold)
+            Text(subtitle, color = TurboColors.TextGray, fontSize = 12.sp)
+            Spacer(Modifier.height(10.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(TurboColors.DarkBackground.copy(alpha = 0.55f))
+                    .clickable(enabled = enabled) { pickerOpen = true }
+                    .padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (selectedApp != "NO TARGET SELECTED") {
+                    AppIconImage(selectedApp, Modifier.size(34.dp))
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(selectedLabel, color = if (selectedApp == "NO TARGET SELECTED") TurboColors.TextGray else Color.White, modifier = Modifier.weight(1f))
+                Text("›", color = TurboColors.TextGray, fontSize = 22.sp)
+            }
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = onStart,
+                enabled = enabled && !isLoading && selectedApp != "NO TARGET SELECTED",
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (isLoading) "Starting..." else "Start GPU Optimization")
+            }
+        }
+    }
+
+    if (pickerOpen) {
+        AppPickerDialog(
+            gamesOnly = gamesOnly,
+            onDismiss = { pickerOpen = false },
+            onAppSelected = {
+                onAppSelected(it)
+                pickerOpen = false
+            }
+        )
+    }
+}
+
+@Composable
+private fun MultiAppPickerDialog(
+    currentSelected: Set<String>,
+    onDismiss: () -> Unit,
+    onAppsSelected: (Set<String>) -> Unit
+) {
+    val context = LocalContext.current
+    var searchQuery by remember { mutableStateOf("") }
+    var selected by remember(currentSelected) { mutableStateOf(currentSelected.toSet()) }
+    val allApps = remember { TurboSpaceManager.getThirdPartyApps(context) }
+    val filtered = remember(searchQuery, allApps) {
+        if (searchQuery.isBlank()) allApps
+        else allApps.filter {
+            TurboSpaceManager.getAppLabel(context, it.packageName).contains(searchQuery, ignoreCase = true)
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Select Apps") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    placeholder = { Text("Search apps...") }
+                )
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = filtered.isNotEmpty() && filtered.all { it.packageName in selected },
+                        onCheckedChange = { checked ->
+                            selected = if (checked) selected + filtered.map { it.packageName }
+                            else selected - filtered.map { it.packageName }
+                        }
+                    )
+                    Text("Select All Results", color = Color.White)
+                }
+                HorizontalDivider()
+                LazyColumn(modifier = Modifier.heightIn(max = 340.dp)) {
+                    items(filtered, key = { it.packageName }) { appInfo ->
+                        val checked = appInfo.packageName in selected
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                selected = if (checked) selected - appInfo.packageName else selected + appInfo.packageName
+                            }.padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(checked = checked, onCheckedChange = { value ->
+                                selected = if (value) selected + appInfo.packageName else selected - appInfo.packageName
+                            })
+                            Spacer(Modifier.width(6.dp))
+                            AppIconImage(appInfo.packageName, Modifier.size(34.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(TurboSpaceManager.getAppLabel(context, appInfo.packageName), color = Color.White)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onAppsSelected(selected) }) { Text("Apply") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
+}
+
+@Composable
+private fun AppPickerDialog(
+    gamesOnly: Boolean,
+    onDismiss: () -> Unit,
+    onAppSelected: (String) -> Unit
+) {
+    val context = LocalContext.current
+    var searchQuery by remember { mutableStateOf("") }
+    val allApps = remember(gamesOnly) {
+        if (gamesOnly) TurboSpaceManager.getGameApps(context) else TurboSpaceManager.getThirdPartyApps(context)
+    }
+    val filtered = remember(searchQuery, allApps) {
+        if (searchQuery.isBlank()) allApps
+        else allApps.filter {
+            TurboSpaceManager.getAppLabel(context, it.packageName).contains(searchQuery, ignoreCase = true)
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (gamesOnly) "Select Game" else "Select App") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    placeholder = { Text(if (gamesOnly) "Search recognized games..." else "Search apps...") }
+                )
+                Spacer(Modifier.height(8.dp))
+                LazyColumn(modifier = Modifier.heightIn(max = 360.dp)) {
+                    items(filtered, key = { it.packageName }) { appInfo ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable { onAppSelected(appInfo.packageName) }.padding(vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            AppIconImage(appInfo.packageName, Modifier.size(40.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(TurboSpaceManager.getAppLabel(context, appInfo.packageName), color = Color.White)
+                                Text(appInfo.packageName, color = TurboColors.TextGray, fontSize = 10.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        confirmButton = {}
+    )
+}
+
+@Composable
+private fun AppIconImage(packageName: String, modifier: Modifier = Modifier.size(40.dp)) {
+    val context = LocalContext.current
+    val bitmap = remember(packageName) {
+        try {
+            context.packageManager.getApplicationIcon(packageName).toBitmap().asImageBitmap()
+        } catch (_: Exception) { null }
+    }
+    if (bitmap != null) {
+        Image(bitmap, contentDescription = null, modifier = modifier.clip(RoundedCornerShape(10.dp)))
+    } else {
+        Text("🎮", modifier = modifier, textAlign = TextAlign.Center)
+    }
+}
+
+// ============================================================================
+// 14. HOME BACKGROUND
+// ============================================================================
+@Composable
+private fun HomeBackground(refreshKey: Int) {
+    val context = LocalContext.current
+    val saved = remember(refreshKey) { TurboSpaceManager.loadBackground(context) }
+    val rawUri = saved.uri ?: return
+    val uri = remember(rawUri) { Uri.parse(rawUri) }
+
+    Box(Modifier.fillMaxSize()) {
+        if (saved.kind == "video") {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx ->
+                    VideoView(ctx).apply {
+                        layoutParams = ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        setVideoURI(uri)
+                        setOnPreparedListener { player ->
+                            player.isLooping = true
+                            player.setVolume(0f, 0f)
+                            start()
+                        }
+                    }
+                }
+            )
+        } else {
+            val loader = remember {
+                ImageLoader.Builder(context)
+                    .components {
+                        if (Build.VERSION.SDK_INT >= 28) add(ImageDecoderDecoder.Factory())
+                        else add(GifDecoder.Factory())
+                    }
+                    .build()
+            }
+            AsyncImage(
+                model = ImageRequest.Builder(context).data(uri).build(),
+                imageLoader = loader,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
+        Box(
+            modifier = Modifier.fillMaxSize().background(
+                Brush.verticalGradient(
+                    listOf(
+                        Color.Black.copy(alpha = 0.38f),
+                        Color.Black.copy(alpha = 0.70f)
+                    )
+                )
+            )
+        )
+    }
+}
+
+// ============================================================================
+// 15. FUTURISTIC GAME BAR / HUD
+// ============================================================================
+@Composable
+private fun TurboSpaceGameBar(
+    onDragOverlay: (Float, Float) -> Unit,
+    onClose: () -> Unit,
+    onReset: () -> Unit
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val selectedFeatures by TurboSpaceRepository.selectedFeatures.collectAsState()
+
+    val cpuText = remember { mutableStateOf("N/A") }
+    val ramText = remember { mutableStateOf("N/A") }
+    val tempText = remember { mutableStateOf("N/A") }
+    val monitor = remember { SystemMonitorEngine(context) }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            monitor.update()
+            cpuText.value = monitor.currentCpuUsage.value
+            ramText.value = monitor.currentRamUsage.value
+            tempText.value = monitor.currentTemperature.value
+            kotlinx.coroutines.delay(1200)
+        }
+    }
+
+    val statefulActive = selectedFeatures.filter { it.stateful }
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 5.dp, vertical = 5.dp),
+        color = TurboColors.HudObsidian.copy(alpha = 0.90f),
+        shape = CutCornerShape(14.dp),
+        border = BorderStroke(1.dp, TurboColors.HudCyan.copy(alpha = 0.70f))
+    ) {
+        Column(Modifier.padding(7.dp)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .pointerInput(Unit) {
+                        detectDragGestures { change, dragAmount ->
+                            change.consume()
+                            onDragOverlay(dragAmount.x, dragAmount.y)
+                        }
+                    },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("TURBO SPACE", color = TurboColors.HudCyan, fontSize = 9.sp, fontWeight = FontWeight.Black)
+                Spacer(Modifier.width(6.dp))
+                Text("GAME BAR", color = TurboColors.HudPurple, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onReset, contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp)) {
+                    Text("RESET", color = TurboColors.HudCrimson, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                }
+                TextButton(onClick = onClose, contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp)) {
+                    Text("CLOSE", color = TurboColors.TextGray, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                HudTelemetryCell("CPU", cpuText.value, TurboColors.HudPurple, Modifier.weight(1f))
+                HudTelemetryCell("RAM", ramText.value.substringBefore(" /"), TurboColors.HudCyan, Modifier.weight(1f))
+                HudTelemetryCell("TEMP", tempText.value, TurboColors.HudCrimson, Modifier.weight(1f))
+            }
+
+            Spacer(Modifier.height(5.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                if (selectedFeatures.isEmpty()) {
+                    HudFeatureSlot(
+                        icon = "•",
+                        label = "NO FEATURES SELECTED",
+                        accent = TurboColors.TextGray,
+                        modifier = Modifier.weight(1f),
+                        onClick = {}
+                    )
+                } else {
+                    selectedFeatures.forEach { feature ->
+                        HudFeatureSlot(
+                            icon = feature.icon,
+                            label = feature.title,
+                            accent = when {
+                                feature in statefulActive -> TurboColors.HudCrimson
+                                else -> TurboColors.HudCyan
+                            },
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                coroutineScope.launch {
+                                    TurboSpaceRepository.runFeatureFromOverlay(context, feature)
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HudTelemetryCell(
+    title: String,
+    value: String,
+    accent: Color,
+    modifier: Modifier
+) {
+    Box(
+        modifier = modifier
+            .height(30.dp)
+            .clip(CutCornerShape(5.dp))
+            .background(accent.copy(alpha = 0.07f))
+            .border(1.dp, accent.copy(alpha = 0.35f), CutCornerShape(5.dp))
+            .padding(horizontal = 7.dp, vertical = 3.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column {
+                Text(title, color = accent, fontSize = 5.sp, fontWeight = FontWeight.Bold)
+                Text(value, color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun HudFeatureSlot(
+    icon: String,
+    label: String,
+    accent: Color,
+    modifier: Modifier,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .height(31.dp)
+            .clip(CutCornerShape(6.dp))
+            .background(accent.copy(alpha = 0.10f))
+            .border(1.dp, accent.copy(alpha = 0.45f), CutCornerShape(6.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 5.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
+            Text(icon, fontSize = 11.sp)
+            Spacer(Modifier.width(3.dp))
+            Text(
+                label.uppercase(),
+                color = Color.White,
+                fontSize = 5.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1
+            )
+        }
+    }
+}
