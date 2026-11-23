@@ -2,20 +2,23 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Notification policy access for supported system controls -->
+    <!-- Notification policy access for DND feature -->
     <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
 
-    <!-- Added for Battery Optimization Permission Card -->
+    <!-- Battery optimization exemption -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-    <!-- Added for Orientation Lock fallback -->
+    <!-- Write settings for orientation lock fallback -->
     <uses-permission android:name="android.permission.WRITE_SETTINGS" tools:ignore="ProtectedPermissions" />
 
-    <!-- Needed to list installed third-party apps for the target picker -->
+    <!-- List installed third-party apps for the target picker -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
-    <!-- Shizuku communicates over a bound service; this lets the app find it -->
+    <!-- ⭐ NEW: Required for Crosshair Overlay (Feature 5 in Programmer Mode) -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Shizuku communicates over a bound service -->
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
     </queries>
@@ -31,8 +34,9 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:screenOrientation="portrait"
             android:theme="@style/Theme.TurboSpace">
+            <!-- ⚠️ REMOVED: android:screenOrientation="portrait" -->
+            <!-- Reason: Rotation Lock feature (Feature 3) needs to change orientation -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
